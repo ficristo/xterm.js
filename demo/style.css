@@ -13,10 +13,21 @@ h1 {
     height: 450px;
     margin: 0 auto;
     padding: 2px;
+    resize: both;
+    overflow-y: scroll;
+    background-color: orange;
 }
 
 #terminal-container .terminal {
     background-color: #111;
     color: #fafafa;
     padding: 2px;
+}
+
+#terminal-container .terminal.xterm {
+    height: 100%;
+}
+
+#terminal-container .xterm-viewport {
+    height: 100% !important;
 }

@@ -65,7 +65,6 @@ function createTerminal() {
   socketURL = protocol + location.hostname + ((location.port) ? (':' + location.port) : '') + '/terminals/';
 
   term.open(terminalContainer);
-  term.fit();
 
   var initialGeometry = term.proposeGeometry(),
       cols = initialGeometry.cols,
@@ -92,6 +91,7 @@ function createTerminal() {
 
 function runRealTerminal() {
   term.attach(socket);
+  term.fit();
   term._initialized = true;
 }
 
@@ -135,3 +135,9 @@ function runFakeTerminal() {
     term.write(data);
   });
 }
+
+var o = { attributes: true };
+var mo = new MutationObserver(function () {
+    term.fit();
+});
+mo.observe(terminalContainer, o);
