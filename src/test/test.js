@@ -21,7 +21,8 @@ describe('xterm.js', function() {
     };
     xterm.element = {
       classList: {
-        toggle: function(){}
+        toggle: function(){},
+        remove: function(){}
       }
     };
   });
@@ -550,6 +551,7 @@ describe('xterm.js', function() {
 
   describe('unicode - surrogates', function() {
     it('2 characters per cell', function () {
+      this.timeout(10000);  // This is needed because istanbul patches code and slows it down
       var high = String.fromCharCode(0xD800);
       for (var i=0xDC00; i<=0xDCFF; ++i) {
         xterm.write(high + String.fromCharCode(i));

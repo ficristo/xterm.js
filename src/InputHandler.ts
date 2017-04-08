@@ -385,7 +385,13 @@ export class InputHandler implements IInputHandler {
         while (j--) this._terminal.eraseLine(j);
         break;
       case 3:
-        ; // no saved lines
+        // Clear scrollback (everything not in viewport)
+        const scrollBackSize = this._terminal.lines.length - this._terminal.rows;
+        if (scrollBackSize > 0) {
+          this._terminal.lines.trimStart(scrollBackSize);
+          this._terminal.ybase = Math.max(this._terminal.ybase - scrollBackSize, 0);
+          this._terminal.ydisp = Math.max(this._terminal.ydisp - scrollBackSize, 0);
+        }
         break;
     }
   }
@@ -1394,7 +1400,7 @@ export class InputHandler implements IInputHandler {
     this._terminal.cursorHidden = false;
     this._terminal.insertMode = false;
     this._terminal.originMode = false;
-    this._terminal.wraparoundMode = false; // autowrap
+    this._terminal.wraparoundMode = true;  // defaults: xterm - true, vt100 - false
     this._terminal.applicationKeypad = false; // ?
     this._terminal.viewport.syncScrollArea();
     this._terminal.applicationCursor = false;

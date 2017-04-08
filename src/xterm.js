@@ -19,6 +19,7 @@ import { C0 } from './EscapeSequences';
 import { InputHandler } from './InputHandler';
 import { Parser } from './Parser';
 import { Renderer } from './Renderer';
+import { Linkifier } from './Linkifier';
 import { CharMeasure } from './utils/CharMeasure';
 import * as Browser from './utils/Browser';
 import * as Keyboard from './utils/Keyboard';
@@ -50,6 +51,13 @@ var WRITE_BUFFER_PAUSE_THRESHOLD = 5;
  * renderer to catch up with a 0ms setTimeout.
  */
 var WRITE_BATCH_SIZE = 300;
+
+/**
+ * The time between cursor blinks. This is driven by JS rather than a CSS
+ * animation due to a bug in Chromium that causes it to use excessive CPU time.
+ * See https://github.com/Microsoft/vscode/issues/22900
+ */
+var CURSOR_BLINK_INTERVAL = 600;
 
 /**
  * Terminal
@@ -158,6 +166,7 @@ function Terminal(options) {
   this.scrollTop = 0;
   this.scrollBottom = this.rows - 1;
   this.customKeydownHandler = null;
+  this.cursorBlinkInterval = null;
 
   // modes
   this.applicationKeypad = false;
@@ -210,6 +219,7 @@ function Terminal(options) {
   this.parser = new Parser(this.inputHandler, this);
   // Reuse renderer if the Terminal is being recreated via a Terminal.reset call.
   this.renderer = this.renderer || null;
+  this.linkifier = this.linkifier || new Linkifier();
 
   // user input states
   this.writeBuffer = [];
@@ -421,13 +431,36 @@ Terminal.prototype.setOption = function(key, value) {
   this[key] = value;
   this.options[key] = value;
   switch (key) {
-    case 'cursorBlink': this.element.classList.toggle('xterm-cursor-blink', value); break;
+    case 'cursorBlink': this.setCursorBlinking(value); break;
     case 'cursorStyle':
       // Style 'block' applies with no class
       this.element.classList.toggle(`xterm-cursor-style-underline`, value === 'underline');
       this.element.classList.toggle(`xterm-cursor-style-bar`, value === 'bar');
       break;
     case 'tabStopWidth': this.setupStops(); break;
+  }
+};
+
+Terminal.prototype.restartCursorBlinking = function () {
+  this.setCursorBlinking(this.options.cursorBlink);
+};
+
+Terminal.prototype.setCursorBlinking = function (enabled) {
+  this.element.classList.toggle('xterm-cursor-blink', enabled);
+  this.clearCursorBlinkingInterval();
+  if (enabled) {
+    var self = this;
+    this.cursorBlinkInterval = setInterval(function () {
+      self.element.classList.toggle('xterm-cursor-blink-on');
+    }, CURSOR_BLINK_INTERVAL);
+  }
+};
+
+Terminal.prototype.clearCursorBlinkingInterval = function () {
+  this.element.classList.remove('xterm-cursor-blink-on');
+  if (this.cursorBlinkInterval) {
+    clearInterval(this.cursorBlinkInterval);
+    this.cursorBlinkInterval = null;
   }
 };
 
@@ -443,6 +476,7 @@ Terminal.bindFocus = function (term) {
     }
     term.element.classList.add('focus');
     term.showCursor();
+    term.restartCursorBlinking.apply(term);
     Terminal.focus = term;
     term.emit('focus', {terminal: term});
   });
@@ -467,6 +501,7 @@ Terminal.bindBlur = function (term) {
       term.send(C0.ESC + '[O');
     }
     term.element.classList.remove('focus');
+    term.clearCursorBlinkingInterval.apply(term);
     Terminal.focus = null;
     term.emit('blur', {terminal: term});
   });
@@ -546,6 +581,9 @@ Terminal.bindKeys = function(term) {
   on(term.textarea, 'compositionupdate', term.compositionHelper.compositionupdate.bind(term.compositionHelper));
   on(term.textarea, 'compositionend', term.compositionHelper.compositionend.bind(term.compositionHelper));
   term.on('refresh', term.compositionHelper.updateCompositionElements.bind(term.compositionHelper));
+  term.on('refresh', function (data) {
+    term.queueLinkification(data.start, data.end)
+  });
 };
 
 
@@ -589,7 +627,7 @@ Terminal.prototype.open = function(parent) {
   this.element.classList.add('terminal');
   this.element.classList.add('xterm');
   this.element.classList.add('xterm-theme-' + this.theme);
-  this.element.classList.toggle('xterm-cursor-blink', this.options.cursorBlink);
+  this.setCursorBlinking(this.options.cursorBlink);
 
   this.element.style.height
   this.element.setAttribute('tabindex', 0);
@@ -607,6 +645,7 @@ Terminal.prototype.open = function(parent) {
   this.rowContainer.classList.add('xterm-rows');
   this.element.appendChild(this.rowContainer);
   this.children = [];
+  this.linkifier.attachToDom(document, this.children);
 
   // Create the container that will hold helpers like the textarea for
   // capturing DOM Events. Then produce the helpers.
@@ -641,7 +680,7 @@ Terminal.prototype.open = function(parent) {
   }
   this.parent.appendChild(this.element);
 
-  this.charMeasure = new CharMeasure(this.helperContainer);
+  this.charMeasure = new CharMeasure(document, this.helperContainer);
   this.charMeasure.on('charsizechanged', function () {
     self.updateCharSizeCSS();
   });
@@ -957,10 +996,8 @@ Terminal.prototype.bindMouse = function() {
     }
 
     // convert to cols/rows
-    w = self.element.clientWidth;
-    h = self.element.clientHeight;
-    x = Math.ceil((x / w) * self.cols);
-    y = Math.ceil((y / h) * self.rows);
+    x = Math.ceil(x / self.charMeasure.width);
+    y = Math.ceil(y / self.charMeasure.height);
 
     // be sure to avoid sending
     // bad positions to the program
@@ -1054,14 +1091,27 @@ Terminal.prototype.destroy = function() {
 /**
  * Tells the renderer to refresh terminal content between two rows (inclusive) at the next
  * opportunity.
- * @param {number} start The row to start from (between 0 and terminal's height terminal - 1)
- * @param {number} end The row to end at (between fromRow and terminal's height terminal - 1)
+ * @param {number} start The row to start from (between 0 and this.rows - 1).
+ * @param {number} end The row to end at (between start and this.rows - 1).
  */
 Terminal.prototype.refresh = function(start, end) {
   if (this.renderer) {
     this.renderer.queueRefresh(start, end);
   }
 };
+
+/**
+ * Queues linkification for the specified rows.
+ * @param {number} start The row to start from (between 0 and this.rows - 1).
+ * @param {number} end The row to end at (between start and this.rows - 1).
+ */
+Terminal.prototype.queueLinkification = function(start, end) {
+  if (this.linkifier) {
+    for (let i = start; i <= end; i++) {
+      this.linkifier.linkifyRow(i);
+    }
+  }
+}
 
 /**
  * Display the cursor element
@@ -1264,6 +1314,66 @@ Terminal.prototype.attachCustomKeydownHandler = function(customKeydownHandler) {
 }
 
 /**
+ * Attaches a http(s) link handler, forcing web links to behave differently to
+ * regular <a> tags. This will trigger a refresh as links potentially need to be
+ * reconstructed. Calling this with null will remove the handler.
+ * @param {LinkHandler} handler The handler callback function.
+ */
+Terminal.prototype.setHypertextLinkHandler = function(handler) {
+  if (!this.linkifier) {
+    throw new Error('Cannot attach a hypertext link handler before Terminal.open is called');
+  }
+  this.linkifier.setHypertextLinkHandler(handler);
+  // Refresh to force links to refresh
+  this.refresh(0, this.rows - 1);
+}
+
+/**
+ * Attaches a validation callback for hypertext links. This is useful to use
+ * validation logic or to do something with the link's element and url.
+ * @param {LinkMatcherValidationCallback} callback The callback to use, this can
+ * be cleared with null.
+ */
+Terminal.prototype.setHypertextValidationCallback = function(handler) {
+  if (!this.linkifier) {
+    throw new Error('Cannot attach a hypertext validation callback before Terminal.open is called');
+  }
+  this.linkifier.setHypertextValidationCallback(handler);
+  // Refresh to force links to refresh
+  this.refresh(0, this.rows - 1);
+}
+
+/**
+   * Registers a link matcher, allowing custom link patterns to be matched and
+   * handled.
+   * @param {RegExp} regex The regular expression to search for, specifically
+   * this searches the textContent of the rows. You will want to use \s to match
+   * a space ' ' character for example.
+   * @param {LinkHandler} handler The callback when the link is called.
+   * @param {LinkMatcherOptions} [options] Options for the link matcher.
+   * @return {number} The ID of the new matcher, this can be used to deregister.
+ */
+Terminal.prototype.registerLinkMatcher = function(regex, handler, options) {
+  if (this.linkifier) {
+    var matcherId = this.linkifier.registerLinkMatcher(regex, handler, options);
+    this.refresh(0, this.rows - 1);
+    return matcherId;
+  }
+}
+
+/**
+ * Deregisters a link matcher if it has been registered.
+ * @param {number} matcherId The link matcher's ID (returned after register)
+ */
+Terminal.prototype.deregisterLinkMatcher = function(matcherId) {
+  if (this.linkifier) {
+    if (this.linkifier.deregisterLinkMatcher(matcherId)) {
+      this.refresh(0, this.rows - 1);
+    }
+  }
+}
+
+/**
  * Handle a keydown event
  * Key Resources:
  *   - https://developer.mozilla.org/en-US/docs/DOM/KeyboardEvent
@@ -1273,6 +1383,8 @@ Terminal.prototype.keyDown = function(ev) {
   if (this.customKeydownHandler && this.customKeydownHandler(ev) === false) {
     return false;
   }
+
+  this.restartCursorBlinking();
 
   if (!this.compositionHelper.keydown.bind(this.compositionHelper)(ev)) {
     if (this.ybase !== this.ydisp) {
@@ -1743,14 +1855,8 @@ Terminal.prototype.resize = function(x, y) {
         this.lines.get(i).push(ch);
       }
     }
-  } else { // (j > x)
-    i = this.lines.length;
-    while (i--) {
-      while (this.lines.get(i).length > x) {
-        this.lines.get(i).pop();
-      }
-    }
   }
+
   this.cols = x;
   this.setupStops(this.cols);
 
